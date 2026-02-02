@@ -1,0 +1,30 @@
+{
+  "name": "vaa-repair",
+  "version": "1.0.0",
+  "description": "CLI tool to recover and broadcast Wormhole VAAs",
+  "type": "module",
+  "bin": {
+    "vaa-repair": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:go": "cd broadcast && go build -o ../bin/broadcast-vaa .",
+    "build:all": "npm run build && npm run build:go",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "@wormhole-foundation/sdk": "^4.9.1",
+    "axios": "^1.6.0",
+    "bs58": "^6.0.0",
+    "commander": "^12.0.0",
+    "ethers": "^6.9.0"
+  },
+  "devDependencies": {
+    "@types/bs58": "^4.0.4",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
