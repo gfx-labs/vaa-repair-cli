@@ -2,9 +2,9 @@ import axios from "axios";
 import type { MessageData } from "./assemble.js";
 import { APTOS_RPC, APTOS_CORE_BRIDGE } from "./utils.js";
 
-const APTOS_CHAIN_ID = 22;
+const CHAIN_ID = 22;
 
-interface AptosWormholeEvent {
+interface WormholeEvent {
   data: {
     consistency_level: number;
     nonce: string;
@@ -15,13 +15,11 @@ interface AptosWormholeEvent {
   };
 }
 
-export async function getMessageFromAptosEvent(eventSequence: bigint): Promise<MessageData> {
+export async function getMessage(eventSequence: bigint): Promise<MessageData> {
   const eventHandle = `${APTOS_CORE_BRIDGE}::state::WormholeMessageHandle`;
   const url = `${APTOS_RPC}/accounts/${APTOS_CORE_BRIDGE}/events/${eventHandle}/event?start=${eventSequence}&limit=1`;
 
-  console.log(`Fetching Aptos event from: ${url}`);
-
-  const response = await axios.get<AptosWormholeEvent[]>(url);
+  const response = await axios.get<WormholeEvent[]>(url);
   const events = response.data;
 
   if (!events || events.length === 0) {
@@ -33,7 +31,7 @@ export async function getMessageFromAptosEvent(eventSequence: bigint): Promise<M
   return {
     timestamp: Number(data.timestamp),
     nonce: Number(data.nonce),
-    emitterChain: APTOS_CHAIN_ID,
+    emitterChain: CHAIN_ID,
     emitterAddress: "0x" + BigInt(data.sender).toString(16),
     sequence: BigInt(data.sequence),
     consistencyLevel: data.consistency_level,

@@ -1,13 +1,15 @@
 import { ethers } from "ethers";
-import { getGuardianIndex, CURRENT_GUARDIAN_SET_INDEX, QUORUM_SIZE, getGuardianName } from "./guardians.js";
+import * as guardians from "./guardians.js";
 import { fetchObservations, decodeAptosTxHash, type Observation } from "./observations.js";
 import { uint16BE, uint32BE, uint64BE, leftPad32, getRpcEndpoint } from "./utils.js";
-import { getMessageFromAptosEvent } from "./aptos.js";
-import { getMessageFromSolana, decodeSolanaTxHash } from "./solana.js";
+import { getMessage as getAptosMessage } from "./aptos.js";
+import { getMessage as getSolanaMessage, decodeTxHash as decodeSolanaTxHash } from "./solana.js";
+import { getMessage as getSuiMessage, decodeTxHash as decodeSuiTxHash } from "./sui.js";
 
 const LOG_MESSAGE_PUBLISHED_TOPIC = "0x6eb224fb001ed210e379b335e35efe88672a8ce935d981a6896b27ffdf52a3b2";
 
 const CHAIN_SOLANA = 1;
+const CHAIN_SUI = 21;
 const CHAIN_APTOS = 22;
 
 export interface MessageData {
@@ -25,7 +27,7 @@ interface SignedObservation {
   signature: Buffer;
 }
 
-async function getMessageFromTx(rpcUrl: string, txHash: string, chainId: number): Promise<MessageData> {
+async function getMessageFromTx(rpcUrl: string, txHash: string, chainId: number, expectedEmitter: string): Promise<MessageData> {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const receipt = await provider.getTransactionReceipt(txHash);
 
@@ -33,18 +35,38 @@ async function getMessageFromTx(rpcUrl: string, txHash: string, chainId: number)
     throw new Error(`Transaction not found: ${txHash}`);
   }
 
-  const log = receipt.logs.find((l) => l.topics[0] === LOG_MESSAGE_PUBLISHED_TOPIC);
+  // Filter by topic and emitter address (topics[1] is the indexed sender/emitter)
+  const normalizedEmitter = expectedEmitter.replace(/^0+/, "").toLowerCase();
+  const log = receipt.logs.find((l) => {
+    if (l.topics[0] !== LOG_MESSAGE_PUBLISHED_TOPIC) return false;
+    if (!l.topics[1]) return false;
+    // topics[1] is the indexed sender address (the emitter), left-padded to 32 bytes
+    const logEmitter = l.topics[1].slice(2).replace(/^0+/, "").toLowerCase();
+    return logEmitter === normalizedEmitter;
+  });
 
   if (!log) {
-    throw new Error("LogMessagePublished event not found in transaction");
+    throw new Error(`LogMessagePublished event not found for emitter ${expectedEmitter} in transaction`);
   }
 
-  const sequence = BigInt(log.topics[1]);
-  const data = log.data.slice(2);
-  const nonce = parseInt(data.slice(0, 64), 16);
-  const consistencyLevel = parseInt(data.slice(128, 192), 16);
-  const payloadLength = parseInt(data.slice(192, 256), 16);
-  const payload = data.slice(256, 256 + payloadLength * 2);
+  // Event: LogMessagePublished(address indexed sender, uint64 sequence, uint32 nonce, bytes payload, uint8 consistencyLevel)
+  // topics[1] = sender (emitter address)
+  // data layout (ABI encoded):
+  //   - bytes 0-32: sequence (uint64, right-aligned)
+  //   - bytes 32-64: nonce (uint32, right-aligned)
+  //   - bytes 64-96: offset to payload (uint256)
+  //   - bytes 96-128: consistencyLevel (uint8, right-aligned)
+  //   - bytes 128+: payload (length prefix + data)
+  const data = log.data.slice(2); // remove 0x prefix
+  const sequence = BigInt("0x" + data.slice(0, 64));
+  const nonce = parseInt(data.slice(64, 128), 16);
+  const consistencyLevel = parseInt(data.slice(192, 256), 16);
+  // Payload starts at offset 0x80 (128 bytes = 256 hex chars), first 32 bytes is length
+  const payloadLength = parseInt(data.slice(256, 320), 16);
+  const payload = data.slice(320, 320 + payloadLength * 2);
+
+  // Emitter is from topics[1], not log.address (which is the core bridge)
+  const emitterAddress = log.topics[1];
 
   const block = await provider.getBlock(receipt.blockNumber);
   if (!block) {
@@ -55,7 +77,7 @@ async function getMessageFromTx(rpcUrl: string, txHash: string, chainId: number)
     timestamp: Number(block.timestamp),
     nonce,
     emitterChain: chainId,
-    emitterAddress: log.address,
+    emitterAddress,
     sequence,
     consistencyLevel,
     payload: Buffer.from(payload, "hex"),
@@ -65,11 +87,11 @@ async function getMessageFromTx(rpcUrl: string, txHash: string, chainId: number)
 function sortAndLimitObservations(observations: Observation[]): SignedObservation[] {
   return observations
     .map((obs) => ({
-      index: getGuardianIndex(obs.guardianAddr),
+      index: guardians.getIndex(obs.guardianAddr),
       signature: Buffer.from(obs.signature, "base64"),
     }))
     .sort((a, b) => a.index - b.index)
-    .slice(0, QUORUM_SIZE);
+    .slice(0, guardians.QUORUM_SIZE);
 }
 
 function buildVAABody(message: MessageData): Buffer {
@@ -90,7 +112,7 @@ function assembleVAA(message: MessageData, observations: Observation[]): Buffer 
 
   return Buffer.concat([
     Buffer.from([1]), // version
-    uint32BE(CURRENT_GUARDIAN_SET_INDEX),
+    uint32BE(guardians.getActiveVersion()),
     Buffer.from([sortedObs.length]),
     ...sortedObs.map((obs) => Buffer.concat([Buffer.from([obs.index]), obs.signature])),
     body,
@@ -103,8 +125,8 @@ function formatEmitterAddress(emitterAddress: string): string {
 
 function logGuardians(observations: Observation[]): void {
   for (const obs of observations) {
-    const idx = getGuardianIndex(obs.guardianAddr);
-    console.log(`    [${idx}] ${getGuardianName(idx)}`);
+    const idx = guardians.getIndex(obs.guardianAddr);
+    console.log(`    [${idx}] ${guardians.getName(idx)}`);
   }
 }
 
@@ -116,20 +138,23 @@ export async function assembleVAAFromObservations(
   rpcUrl?: string
 ): Promise<{ vaa: Buffer; message: MessageData; sigCount: number }> {
   const formattedEmitter = formatEmitterAddress(emitterAddress);
+  const version = guardians.getActiveVersion();
 
   console.log(`\n[1/3] Fetching guardian observations...`);
-  const observations = await fetchObservations(chainId, formattedEmitter, sequence);
+  const allObservations = await fetchObservations(chainId, formattedEmitter, sequence);
+  const observations = allObservations.filter((obs) => guardians.isKnown(obs.guardianAddr));
 
-  console.log(`  Found ${observations.length} observations`);
+  const skipped = allObservations.length - observations.length;
+  console.log(`  Found ${allObservations.length} observations${skipped > 0 ? ` (${skipped} from non-v${version} guardians, skipped)` : ""}`);
 
-  if (observations.length < QUORUM_SIZE) {
-    console.log(`\n  Guardians who signed:`);
+  if (observations.length < guardians.QUORUM_SIZE) {
+    console.log(`\n  Guardians who signed (v${version} set):`);
     logGuardians(observations);
-    throw new Error(`Insufficient observations: ${observations.length}/${QUORUM_SIZE} required for quorum`);
+    throw new Error(`Insufficient v${version} observations: ${observations.length}/${guardians.QUORUM_SIZE} required for quorum`);
   }
 
-  console.log(`  Quorum reached (${observations.length}/${QUORUM_SIZE})`);
-  console.log(`\n  Guardians who signed:`);
+  console.log(`  Quorum reached (${observations.length}/${guardians.QUORUM_SIZE})`);
+  console.log(`\n  Guardians who signed (v${version} set):`);
   logGuardians(observations);
 
   const firstObs = observations[0];
@@ -164,13 +189,19 @@ async function fetchMessage(
   if (chainId === CHAIN_SOLANA) {
     const txSignature = decodeSolanaTxHash(txHash);
     console.log(`\n[2/3] Fetching message from Solana...`);
-    return getMessageFromSolana(txSignature, formattedEmitter, sequence);
+    return getSolanaMessage(txSignature, formattedEmitter, sequence);
+  }
+
+  if (chainId === CHAIN_SUI) {
+    const txDigest = decodeSuiTxHash(txHash);
+    console.log(`\n[2/3] Fetching message from Sui (tx: ${txDigest})...`);
+    return getSuiMessage(txDigest, rpcUrl);
   }
 
   if (chainId === CHAIN_APTOS) {
     const eventSequence = decodeAptosTxHash(txHash);
     console.log(`\n[2/3] Fetching message from Aptos (event sequence: ${eventSequence})...`);
-    return getMessageFromAptosEvent(eventSequence);
+    return getAptosMessage(eventSequence);
   }
 
   const txHashBuffer = Buffer.from(txHash, "base64");
@@ -182,5 +213,5 @@ async function fetchMessage(
     throw new Error(`No RPC endpoint available for chain ${chainId}. Use --rpc to specify one.`);
   }
 
-  return getMessageFromTx(rpc, evmTxHash, chainId);
+  return getMessageFromTx(rpc, evmTxHash, chainId, formattedEmitter);
 }

@@ -59,6 +59,8 @@ export const APTOS_CORE_BRIDGE = getCoreBridge("Aptos");
 export const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 export const SOLANA_CORE_BRIDGE = getCoreBridge("Solana");
 
+export const SUI_RPC = "https://sui-rpc.publicnode.com";
+
 export function getChainId(chainName: string): number {
   const id = CHAIN_IDS[chainName.toLowerCase()];
   if (id === undefined) {
